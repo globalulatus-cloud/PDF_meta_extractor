@@ -1,0 +1,9 @@
+[server]
+# Raise max upload size to 2000 MB (2 GB) for large PDFs
+maxUploadSize = 2000
+
+# Keep connection alive for large file processing
+maxMessageSize = 2000
+
+[browser]
+gatherUsageStats = false
