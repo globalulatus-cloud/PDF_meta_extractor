@@ -44,24 +44,24 @@ FOOTER_ES = re.compile(
 
 # ── Extraction helpers ────────────────────────────────────────────────────────
 
-def extract_pages(pdf_bytes: bytes,
+def extract_pages(pdf_source,
                   font_size: float = FONT_SIZE_TARGET,
-                  tolerance: float = FONT_SIZE_TOLERANCE) -> list[dict]:
+                  tolerance: float = FONT_SIZE_TOLERANCE,
+                  progress_bar=None) -> list[dict]:
     """
-    Return a list of page-dicts, one per PDF page:
-      {
-        "page_num": int,
-        "card_id": str | None,      # e.g. "1-1"
-        "anchor":  str | None,      # "▲" / "●" / "■"
-        "anchor_name": str | None,  # "Triangle" / "Circle" / "Square"
-        "title":   str | None,      # largest font text (~28 pt)
-        "steps":   list[str],       # numbered step texts
-        "footer":  str | None,      # Grade/Grado line
-        "all_f28": list[str],       # every span at target font size
-        "raw_blocks": list[dict],   # full span data for debugging
-      }
+    Memory-efficient extraction: streams the PDF page-by-page.
+    pdf_source can be:
+      - a file path (str / Path)  → opened directly from disk, lowest RAM use
+      - raw bytes                 → loaded into a BytesIO buffer
+    raw_blocks are NOT stored after extraction to keep RAM usage low.
     """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    import os
+    if isinstance(pdf_source, (str, os.PathLike)):
+        doc = fitz.open(str(pdf_source))
+    else:
+        doc = fitz.open(stream=pdf_source, filetype="pdf")
+
+    total_pages = doc.page_count
     pages = []
 
     for page_num, page in enumerate(doc, start=1):
@@ -154,8 +154,16 @@ def extract_pages(pdf_bytes: bytes,
             "steps":       steps,
             "footer":      footer,
             "all_f28":     all_f28,
-            "raw_blocks":  all_spans,
+            # raw_blocks intentionally omitted — too large for 500 MB PDFs
+            "raw_blocks":  all_spans if page_num == 1 else [],
         })
+
+        # Update progress bar if provided (Streamlit)
+        if progress_bar is not None:
+            progress_bar.progress(page_num / total_pages)
+
+        # Release page resources immediately
+        page = None
 
     doc.close()
     return pages
@@ -468,6 +476,12 @@ def main():
         "and exports matched source/target pairs to Excel."
     )
 
+    st.info(
+        "Large PDFs (500 MB+) are supported. Files are streamed page-by-page "
+        "and temp files are deleted immediately after extraction.",
+        icon="ℹ️",
+    )
+
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("🇬🇧 Source PDF (English)")
@@ -475,12 +489,16 @@ def main():
             "Upload English PDF", type="pdf", key="src",
             label_visibility="collapsed"
         )
+        if src_file:
+            st.caption(f"Size: {src_file.size / 1_048_576:.1f} MB")
     with col2:
         st.subheader("🇪🇸 Target PDF (Spanish)")
         tgt_file = st.file_uploader(
             "Upload Spanish PDF", type="pdf", key="tgt",
             label_visibility="collapsed"
         )
+        if tgt_file:
+            st.caption(f"Size: {tgt_file.size / 1_048_576:.1f} MB")
 
     run = st.button("🚀 Extract & Generate Excel", use_container_width=True,
                     type="primary")
@@ -493,10 +511,33 @@ def main():
         st.error("Please upload **both** PDFs before extracting.")
         return
 
-    with st.spinner("Extracting source PDF…"):
-        src_pages = extract_pages(src_file.read(), font_size, tolerance)
-    with st.spinner("Extracting target PDF…"):
-        tgt_pages = extract_pages(tgt_file.read(), font_size, tolerance)
+    import tempfile, os
+
+    def save_and_extract(uploaded_file, label, font_size, tolerance):
+        """Write upload to a temp file then stream-extract to keep RAM low."""
+        suffix = ".pdf"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            # Stream the upload in 8 MB chunks to avoid one giant .read()
+            CHUNK = 8 * 1024 * 1024
+            uploaded_file.seek(0)
+            while True:
+                chunk = uploaded_file.read(CHUNK)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+
+        st.write(f"**{label}** — saved to temp file, extracting…")
+        bar = st.progress(0)
+        try:
+            pages = extract_pages(tmp_path, font_size, tolerance, progress_bar=bar)
+        finally:
+            os.unlink(tmp_path)   # delete temp file immediately after extraction
+        bar.empty()
+        return pages
+
+    src_pages = save_and_extract(src_file, "English PDF", font_size, tolerance)
+    tgt_pages = save_and_extract(tgt_file, "Spanish PDF", font_size, tolerance)
 
     with st.spinner("Matching pages & building Excel…"):
         rows       = match_pages(src_pages, tgt_pages)
